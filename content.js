@@ -80,16 +80,16 @@ function processImage(imgElement, session) {
 // Function to get image data from the DOM
 function getImageData(imgElement) {
   const canvas = document.createElement("canvas");
-  canvas.width = 224;
-  canvas.height = 224;
+  canvas.width = 256;
+  canvas.height = 256;
   const ctx = canvas.getContext("2d");
 
   imgElement.crossOrigin = "Anonymous";
 
-  ctx.drawImage(imgElement, 0, 0, 224, 224);
+  ctx.drawImage(imgElement, 0, 0, 256, 256);
 
   try {
-    const imageData = ctx.getImageData(0, 0, 224, 224);
+    const imageData = ctx.getImageData(0, 0, 256, 256);
     console.log("Successfully got image data for:", imgElement.src);
     console.log(
       "Raw Image Data (first 10 values):",
@@ -105,15 +105,19 @@ function getImageData(imgElement) {
 // Function to run inference using the ONNX model
 async function runInference(session, imageData) {
   try {
-    const inputTensor = preprocessImageData(imageData);
+    const { rgbTensor, noiseTensor } = preprocessImageData(imageData);
 
-    const feeds = { input: inputTensor };
+    // List input names for clarity
+    const inputNames = session.inputNames;
+    console.log("Model input names:", inputNames);  // Should include 'rgb_input' and 'noise_input'
+
+    const feeds = {};
+    feeds[inputNames[0]] = rgbTensor;     // e.g. 'rgb_input'
+    feeds[inputNames[1]] = noiseTensor;   // e.g. 'noise_input'
+
     const output = await session.run(feeds);
 
     const outputName = session.outputNames[0];
-    console.log("Model input names:", session.inputNames);
-    console.log("Model output names:", session.outputNames);
-
     const logits = output[outputName].data;
 
     const logit = logits[0];
@@ -131,17 +135,55 @@ async function runInference(session, imageData) {
   }
 }
 
+
 // Function to preprocess image data for ONNX model
 function preprocessImageData(imageData) {
   const width = imageData.width;
   const height = imageData.height;
   const data = imageData.data;
 
-  const mean = [0.485, 0.456, 0.406];  // RGB means
-  const std  = [0.229, 0.224, 0.225];  // RGB std devs
+  const mean = [0.485, 0.456, 0.406];
+  const std = [0.229, 0.224, 0.225];
 
-  const floatData = new Float32Array(1 * 3 * height * width);
+  const rgb = new Float32Array(1 * 3 * height * width);
+  const noise = new Float32Array(1 * 3 * height * width);
 
+  // Precompute grayscale version for Laplacian (simple luminance approximation)
+  const grayscale = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      const r = data[idx * 4 + 0] / 255.0;
+      const g = data[idx * 4 + 1] / 255.0;
+      const b = data[idx * 4 + 2] / 255.0;
+      grayscale[idx] = 0.2989 * r + 0.5870 * g + 0.1140 * b;
+    }
+  }
+
+  // Apply 3x3 Laplacian kernel to grayscale image
+  const laplacian = new Float32Array(width * height);
+  const kernel = [
+     0, -1,  0,
+    -1,  4, -1,
+     0, -1,  0
+  ];
+
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      let sum = 0.0;
+      for (let ky = -1; ky <= 1; ky++) {
+        for (let kx = -1; kx <= 1; kx++) {
+          const ix = x + kx;
+          const iy = y + ky;
+          const w = kernel[(ky + 1) * 3 + (kx + 1)];
+          sum += w * grayscale[iy * width + ix];
+        }
+      }
+      laplacian[y * width + x] = sum;
+    }
+  }
+
+  // Populate RGB and noise tensors
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const idx = y * width + x;
@@ -149,13 +191,23 @@ function preprocessImageData(imageData) {
       const g = data[idx * 4 + 1] / 255.0;
       const b = data[idx * 4 + 2] / 255.0;
 
-      // Normalize using ImageNet stats
-      floatData[0 * height * width + y * width + x] = (r - mean[0]) / std[0]; // R
-      floatData[1 * height * width + y * width + x] = (g - mean[1]) / std[1]; // G
-      floatData[2 * height * width + y * width + x] = (b - mean[2]) / std[2]; // B
+      const rNorm = (r - mean[0]) / std[0];
+      const gNorm = (g - mean[1]) / std[1];
+      const bNorm = (b - mean[2]) / std[2];
+
+      rgb[0 * height * width + y * width + x] = rNorm;
+      rgb[1 * height * width + y * width + x] = gNorm;
+      rgb[2 * height * width + y * width + x] = bNorm;
+
+      const n = laplacian[idx];  // noise scalar for all 3 channels
+      noise[0 * height * width + y * width + x] = n;
+      noise[1 * height * width + y * width + x] = n;
+      noise[2 * height * width + y * width + x] = n;
     }
   }
 
-  return new ort.Tensor('float32', floatData, [1, 3, height, width]);
+  return {
+    rgbTensor: new ort.Tensor('float32', rgb, [1, 3, height, width]),
+    noiseTensor: new ort.Tensor('float32', noise, [1, 3, height, width])
+  };
 }
-
